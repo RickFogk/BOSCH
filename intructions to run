@@ -1,0 +1,13 @@
+Here's a checklist:
+
+ROS Core running
+RPLIDAR node running and publishing data
+Robot state publisher running (if applicable)
+SLAM node running (if you're using SLAM)
+OAK-D Lite camera connected
+All necessary ROS topics being published (check with rostopic list)
+Your Python script running
+
+MAIN ISTRUCTIONS:
+1)- Rodar ROSCORE em uma CMD;
+2)- Em outra janela CMD, rodar: roslaunch rplidar_ros rplidar_a1.launch
