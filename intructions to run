@@ -10,4 +10,4 @@ Your Python script running
 
 MAIN ISTRUCTIONS:
 1)- Rodar ROSCORE em uma CMD;
-2)- Em outra janela CMD, rodar: roslaunch rplidar_ros rplidar_a1.launch
+2)- Em outra janela CMD, rodar: rplidar_ros rplidar_a1.launch (alternativamente)-> roslaunch rplidar_ros rplidar_a1.launch
