@@ -1,5 +1,8 @@
 Here's a checklist:
 
+FIRST OF ALL:
+CONNECT THE LAPTOP WITH THE SAME WIFI NETWORK AS JETSON NANO, IN ORDER TO USE IT HEADLLESS
+
 Para iniciar o JETSON:
 a)- ligar o botao PWR
 b)- ao logar a tela monitor ficara blank, pois usaremos o JETSON em modo HEADLESS (sem teclado e sem mouse).
