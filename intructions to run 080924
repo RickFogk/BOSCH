@@ -14,11 +14,11 @@ e)- Abrir 2 CMDs
 
 
 MAIN ISTRUCTIONS:
-1)- Rodaro commando: roscore  (em uma CMD dedicada);
-2)- roslaunch rplidar_ros rplidar.launch
+1)- Rodar o commando: roscore  (em uma CMD dedicada);
+2)- roslaunch rplidar_ros rplidar.launch (em outra CMD dedicada)
 
 
-
+-------------------------------------------------------------------------------------------------------------------------
 TROUBLESHOOT:
 1. Verify the Package Name:
 Make sure you have the correct package name. The error message suggests that rplidar_ros may not be the correct name of the package or the launch file.
@@ -73,12 +73,15 @@ Traceback (most recent call last):
 RuntimeError: Failed to find device after booting, error message: X_LINK_DEVICE_NOT_FOUND
 
 
-
-ALSO IF GET GPIO PERMISIONS ISSUES:
+---------------------------------------------------------------------------------------------------------------
+ALSO IF GET GPIO PERMISIONS ISSUES (because the servos):
 sudo groupadd -f -r gpio
 sudo usermod -aG gpio rickfogk
 sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo chown root:gpio /dev/gpiochip*
+sudo chmod 660 /dev/gpiochip*
 
+----------------------------------------------------------------------------------------------------------------
 rickfogk@rickfogk-desktop:~/darknet$ source /opt/ros/melodic/setup.bash
 
 
