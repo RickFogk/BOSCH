@@ -76,7 +76,7 @@ RuntimeError: Failed to find device after booting, error message: X_LINK_DEVICE_
 
 ALSO IF GET GPIO PERMISIONS ISSUES:
 sudo groupadd -f -r gpio
-sudo usermod -aG gpio $USER
+sudo usermod -aG gpio rickfogk
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
 rickfogk@rickfogk-desktop:~/darknet$ source /opt/ros/melodic/setup.bash
