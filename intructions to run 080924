@@ -1,0 +1,79 @@
+Here's a checklist:
+
+FIRST OF ALL:
+CONNECT THE LAPTOP WITH THE SAME WIFI NETWORK AS JETSON NANO, IN ORDER TO USE IT HEADLLESS
+
+Para iniciar o JETSON:
+a)- ligar o botao PWR
+b)- ao logar a tela monitor ficara blank, pois usaremos o JETSON em modo HEADLESS (sem teclado e sem mouse).
+c)- acessar o jetson via REALVNC Viewer.
+
+Apos accessar o sistema operacional.
+d)- ABrir o VS CODE (aqui chamado de CODE-OSS)
+e)- Abrir 2 CMDs
+
+
+MAIN ISTRUCTIONS:
+1)- Rodaro commando: roscore  (em uma CMD dedicada);
+2)- roslaunch rplidar_ros rplidar.launch
+
+
+
+TROUBLESHOOTç
+1. Verify the Package Name:
+Make sure you have the correct package name. The error message suggests that rplidar_ros may not be the correct name of the package or the launch file.
+
+You can check whether the package is correctly installed by running:
+
+bash
+Copy code
+rospack list | grep rplidar_ros
+This command will list any packages that match rplidar_ros. If it doesn't return anything, it means the package isn't installed or you might have the wrong package name.
+
+2. Check the Launch File Name:
+Make sure that the launch file you're trying to run exists in the package. The error suggests you're trying to run rplida.launch, but it should probably be rplidar.launch or rplidar_a2.launch. You can verify the available launch files in the package by navigating to the rplidar_ros package directory and listing the contents:
+
+bash
+Copy code
+cd ~/catkin_ws/src/rplidar_ros/launch
+ls
+Check if the correct launch file is present. Typically, the file should be named rplidar.launch or something similar.
+
+3. Correct the Launch Command:
+If the package is correctly installed and the launch file exists, the command should be:
+
+bash
+Copy code
+roslaunch rplidar_ros rplidar.launch
+or
+
+bash
+Copy code
+roslaunch rplidar_ros rplidar_a2.launch
+4. Source the Workspace:
+Ensure that you've sourced your ROS workspace after building it. Run the following command before launching any ROS nodes:
+
+bash
+Copy code
+source ~/catkin_ws/devel/setup.bash
+You can also add this line to your .bashrc so it is automatically sourced every time you open a terminal:
+
+bash
+Copy code
+echo "source ~/catkin_ws/devel/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+
+
+
+3)- Geralmente o comando alternativo seria a PRINCIPAL, mas as vezes acontece:
+An error occurred: Failed to find device after booting, error message: X_LINK_DEVICE_NOT_FOUND
+Traceback (most recent call last):
+  File "/home/rickfogk/darknet/fruit_detection10.py", line 335, in main
+    with dai.Device(pipeline) as device:
+RuntimeError: Failed to find device after booting, error message: X_LINK_DEVICE_NOT_FOUND
+
+TRY:
+rickfogk@rickfogk-desktop:~/darknet$ source /opt/ros/melodic/setup.bash
+
+
+
