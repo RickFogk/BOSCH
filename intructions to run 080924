@@ -19,7 +19,7 @@ MAIN ISTRUCTIONS:
 
 
 
-TROUBLESHOOTç
+TROUBLESHOOT:
 1. Verify the Package Name:
 Make sure you have the correct package name. The error message suggests that rplidar_ros may not be the correct name of the package or the launch file.
 
@@ -72,7 +72,13 @@ Traceback (most recent call last):
     with dai.Device(pipeline) as device:
 RuntimeError: Failed to find device after booting, error message: X_LINK_DEVICE_NOT_FOUND
 
-TRY:
+
+
+ALSO IF GET GPIO PERMISIONS ISSUES:
+sudo groupadd -f -r gpio
+sudo usermod -aG gpio $USER
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
 rickfogk@rickfogk-desktop:~/darknet$ source /opt/ros/melodic/setup.bash
 
 
