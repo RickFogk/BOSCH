@@ -92,3 +92,4 @@ TO RUN ARDUINO -> JETSON NANO:
 2)- In another cmd, type roscore
 3)- rosrun rosserial_python serial_node.py /dev/ttyACM0 0u ttyACM1(verify port in arduino IDE)
 4)- If want to check talk between arduino and jetson type: rosrun rosserial_python serial_node.py /dev/ttyACM0
+5)- in another CMD type: rostopic echo chatter
