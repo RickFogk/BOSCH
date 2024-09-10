@@ -84,5 +84,11 @@ sudo chmod 660 /dev/gpiochip*
 ----------------------------------------------------------------------------------------------------------------
 rickfogk@rickfogk-desktop:~/darknet$ source /opt/ros/melodic/setup.bash
 
+----------------------------------------------------------------------------------------------------------------
 
 
+TO RUN ARDUINO -> JETSON NANO:
+1)- Type: arduino (in a dedicated cmd)
+2)- In another cmd, type roscore
+3)- rosrun rosserial_python serial_node.py /dev/ttyACM0 0u ttyACM1(verify port in arduino IDE)
+4)- If want to check talk between arduino and jetson type: rosrun rosserial_python serial_node.py /dev/ttyACM0
