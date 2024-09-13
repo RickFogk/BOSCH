@@ -93,3 +93,43 @@ TO RUN ARDUINO -> JETSON NANO:
 3)- rosrun rosserial_python serial_node.py /dev/ttyACM0 0u ttyACM1(verify port in arduino IDE)
 4)- If want to check talk between arduino and jetson type: rosrun rosserial_python serial_node.py /dev/ttyACM0
 5)- in another CMD type: rostopic echo chatter
+
+
+----------------------------------------------------------------------------------------------------------------
+LIDAR TROUBLESHOOTING
+
+Edit the rplidar.launch file:
+Copy: 
+sudo nano /opt/ros/melodic/share/rplidar_ros/launch/rplidar.launch
+
+In this file, look for the line that specifies the serial port. It should look something like this:
+xmlCopy: 
+<param name="serial_port" type="string" value="/dev/ttyUSB0"/>
+
+Change it to:
+xmlCopy<param name="serial_port" type="string" value="/dev/ttyUSB1"/>
+
+Save the file and exit the editor (in nano, you can do this by pressing Ctrl+X, then Y, then Enter).
+Now, try to launch the RPLIDAR node:
+Copy:
+roslaunch rplidar_ros rplidar.launch
+
+In a new terminal, check if you're receiving LIDAR data:
+Copy:
+rostopic echo /scan
+
+
+If you see data streaming, it means the LIDAR is now connected and working correctly.
+
+Next, modify your Python script to ensure it's subscribing to the correct topic. The LIDAR data is typically published on the /scan topic. Make sure your rospy.Subscriber for LIDAR data looks like this:
+pythonCopyrospy.Subscriber("/scan", LaserScan, lidar_callback)
+
+Run your Python script again. You should now see the LIDAR window and receive LIDAR data.
+
+If you're still having issues, please provide:
+
+The output of rosnode list when your RPLIDAR node is running.
+The content of the rplidar.launch file after you've made the changes.
+Any error messages you're seeing when you run your Python script.
+
+This information will help us further diagnose any remaining issues with the LIDAR connection and data flow. CopyRetry
