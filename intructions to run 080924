@@ -96,6 +96,10 @@ TO RUN ARDUINO -> JETSON NANO:
 4)- If want to check talk between arduino and jetson type: rosrun rosserial_python serial_node.py /dev/ttyACM0
 5)- in another CMD type: rostopic echo chatter
 
+CHECKING PUBLISH:
+a)- rosnode list; (look for the node tha should be published to /chatter.
+b)- rostopic list; (if you dont see /chatter in the list, the Arduino might be publish
+
 
 ----------------------------------------------------------------------------------------------------------------
 LIDAR TROUBLESHOOTING
