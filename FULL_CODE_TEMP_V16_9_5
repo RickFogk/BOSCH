@@ -1,0 +1,1078 @@
+import cv2
+import numpy as np
+import depthai as dai
+import rospy
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import Vector3
+import time
+from threading import Thread, Lock, Event
+from queue import Queue
+from gtts import gTTS
+import os
+import pygame
+import logging
+import csv
+from datetime import datetime
+from adafruit_servokit import ServoKit
+import math
+import sys
+import speech_recognition as sr
+from pynput import keyboard
+import unicodedata
+
+# ===========================
+# Configuration
+# ===========================
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global variables
+lidar_data = []
+lidar_angle_min = 0.0
+lidar_angle_increment = 0.0
+occupancy_grid = None
+acceleration_data = Vector3()
+speech_queue = Queue()
+last_speech_time = 0
+SPEECH_COOLDOWN = 3
+last_obstacle_distance = None
+last_obstacle_announce_time = 0
+last_fruit_alert_time = 0
+last_fruit_detection_time = 0
+sweeping = False
+fine_tuning = False
+frames_without_detection = 0
+pan_direction = 1
+tilt_direction = 1
+current_tilt = 0
+current_pan = 30
+last_reported_positions = {}
+fruit_last_seen_time = None
+running = True
+fruit_state_analyzed = False
+fruit_centered = False
+initial_obstacle_alert_made = False
+sleep_mode = True
+fruit_processed = False
+user_choice = None
+user_choice_lock = Lock()
+fruit = None  # For keyboard input
+keyboard_lock = Lock()
+choice_event = Event()
+selected_fruit_index = None
+last_reported_distance = None
+last_reported_angle = None
+fruit_position = None
+
+# Constants
+PAN_DEFAULT, TILT_DEFAULT = 30, 10
+PAN_MIN, PAN_MAX = 0, 90
+TILT_MIN, TILT_MAX = 10, 90
+SWEEP_TILT_MIN = 20
+MAX_FRAMES_WITHOUT_DETECTION = 10
+SWEEP_PAN_STEP = 5
+SWEEP_TILT_STEP = 5
+SWEEP_DELAY = 0.01
+FINE_TUNE_STEP = 1
+FINE_TUNE_DELAY = 0.05
+CONFIDENCE_THRESHOLD = 0.3
+NMS_THRESHOLD = 0.4
+OBSTACLE_DISTANCE_THRESHOLD = 1.0
+DETECTION_ANGLE_RANGE = 90
+OBSTACLE_ANNOUNCE_INTERVAL = 5
+FRUIT_LOSS_THRESHOLD = 10
+POSITION_CHANGE_THRESHOLD = 0.2
+FRUIT_LOSS_TIMEOUT = 10
+DISTANCE_VARIATION_THRESHOLD = 20
+ANGLE_VARIATION_THRESHOLD = 15
+
+# New constants for Potential Fields
+ATTRACTIVE_FORCE_GAIN = 1.0
+REPULSIVE_FORCE_GAIN = 100.0
+OBSTACLE_INFLUENCE_DISTANCE = 1.0  # meters
+
+# YOLO Configuration Files
+YOLO_WEIGHTS = "yolov4-tiny.weights"
+YOLO_CONFIG = "yolov4-tiny.cfg"
+COCO_NAMES = "coco.names"
+
+# Fruits of Interest
+FRUITS = ["banana", "apple"]
+DETECTION_CLASSES = FRUITS.copy()
+
+# Class display names mapping
+CLASS_DISPLAY_NAMES = {
+    "banana": "banana",
+    "apple": "maçã",
+}
+
+# Color ranges for fruit quality detection in HSV
+COLOR_RANGES = {
+    "banana": {
+        "green": {"lower": np.array([36, 50, 70]), "upper": np.array([89, 255, 255])},
+        "yellow": {"lower": np.array([20, 100, 100]), "upper": np.array([30, 255, 255])},
+        "brown": {"lower": np.array([10, 50, 20]), "upper": np.array([20, 200, 200])},
+    },
+    "apple": {
+        "red1": {"lower": np.array([0, 70, 50]), "upper": np.array([10, 255, 255])},
+        "red2": {"lower": np.array([170, 70, 50]), "upper": np.array([180, 255, 255])},
+        "green": {"lower": np.array([36, 50, 70]), "upper": np.array([89, 255, 255])},
+        "yellow": {"lower": np.array([15, 50, 70]), "upper": np.array([35, 255, 255])},
+        "brown": {"lower": np.array([0, 0, 0]), "upper": np.array([20, 255, 70])},
+    }
+}
+
+# Data Logging Setup
+log_file = f"fruit_detection_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+log_headers = ["Timestamp", "Pan", "Tilt", "Fruit_Detected", "Fruit_Type", "Confidence", "State", "Distance", "Angle"]
+
+# Activation phrases
+ACTIVATION_PHRASES = [
+    "olá smartface", "ola smartface",
+    "olá smart face", "ola smart face",
+    "hello smartface", "hello smart face",
+]
+
+# ===========================
+# Initialization
+# ===========================
+
+# Initialize ServoKit
+try:
+    kit = ServoKit(channels=16)
+    tilt_servo, pan_servo = 0, 1
+    logging.info("ServoKit initialized successfully.")
+except Exception as e:
+    logging.error(f"Failed to initialize ServoKit: {e}")
+    sys.exit(1)
+
+# Load YOLOv4 Tiny model
+try:
+    net = cv2.dnn.readNet(YOLO_WEIGHTS, YOLO_CONFIG)
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+    logging.info("YOLO model loaded successfully with CUDA backend.")
+except Exception as e:
+    logging.error(f"Failed to load YOLO model with CUDA backend: {e}")
+    try:
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        logging.warning("Falling back to CPU backend for YOLO model.")
+    except Exception as cpu_e:
+        logging.error(f"Failed to set CPU backend for YOLO model: {cpu_e}")
+        sys.exit(1)
+
+# Load the COCO class names
+try:
+    with open(COCO_NAMES, "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    logging.info("COCO class names loaded successfully.")
+except Exception as e:
+    logging.error(f"Failed to load COCO class names: {e}")
+    sys.exit(1)
+
+# ===========================
+# Functions
+# ===========================
+
+def initialize_pygame():
+    try:
+        pygame.init()
+        pygame.mixer.init()
+        logging.info("Pygame initialized successfully.")
+    except pygame.error as e:
+        logging.error(f"Failed to initialize Pygame: {e}")
+        sys.exit(1)
+
+def setup_log_file():
+    try:
+        with open(log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(log_headers)
+        logging.info("Log file set up successfully.")
+    except Exception as e:
+        logging.error(f"Failed to set up log file: {e}")
+
+def log_data(pan, tilt, fruit_detected, fruit_type, confidence, state, distance, angle):
+    try:
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([datetime.now(), pan, tilt, fruit_detected, fruit_type, confidence, state, distance, angle])
+    except Exception as e:
+        logging.error(f"Failed to log data: {e}")
+
+def text_to_speech(text):
+    try:
+        tts = gTTS(text=text, lang='pt', slow=False)
+        filename = "temp_speech.mp3"
+        tts.save(filename)
+        pygame.mixer.music.load(filename)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+        os.remove(filename)
+    except Exception as e:
+        logging.error(f"Error in text-to-speech: {e}")
+
+def lidar_callback(scan_data):
+    global lidar_data, lidar_angle_min, lidar_angle_increment
+    lidar_data = scan_data.ranges
+    lidar_angle_min = scan_data.angle_min
+    lidar_angle_increment = scan_data.angle_increment
+
+def occupancy_grid_callback(grid_msg):
+    global occupancy_grid
+    occupancy_grid = np.array(grid_msg.data).reshape((grid_msg.info.height, grid_msg.info.width))
+
+def acceleration_callback(msg):
+    global acceleration_data
+    acceleration_data = msg
+
+def is_cart_moving():
+    accel_magnitude = math.sqrt(acceleration_data.x**2 + acceleration_data.y**2 + acceleration_data.z**2)
+    ACCELERATION_THRESHOLD = 0.1
+    return accel_magnitude > ACCELERATION_THRESHOLD
+
+def get_distance(depth_frame, bbox):
+    try:
+        x, y, w, h = bbox
+        x = max(0, x)
+        y = max(0, y)
+        x_end = min(depth_frame.shape[1], x + w)
+        y_end = min(depth_frame.shape[0], y + h)
+        depth_roi = depth_frame[y:y_end, x:x_end]
+        valid_depths = depth_roi[(depth_roi > 0) & (depth_roi < 10000)]
+        if valid_depths.size > 0:
+            return np.median(valid_depths)
+        else:
+            return None
+    except Exception as e:
+        logging.error(f"Error calculating depth: {e}")
+        return None
+
+def classify_banana_quality(image):
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    hsv_image = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+    masks = {}
+    for color, ranges in COLOR_RANGES["banana"].items():
+        mask = cv2.inRange(hsv_image, ranges["lower"], ranges["upper"])
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        masks[color] = mask
+
+    total_mask = cv2.bitwise_or(masks["yellow"], masks["green"])
+    total_area = cv2.countNonZero(total_mask)
+
+    color_areas = {}
+    for color, mask in masks.items():
+        color_areas[color] = cv2.countNonZero(mask)
+
+    color_percentages = {}
+    for color, area in color_areas.items():
+        if total_area > 0:
+            color_percentages[color] = (area / total_area) * 100
+        else:
+            color_percentages[color] = 0
+
+    yellow_pct = color_percentages.get("yellow", 0)
+    green_pct = color_percentages.get("green", 0)
+    brown_pct = color_percentages.get("brown", 0)
+
+    logging.debug(f"Banana color percentages: Yellow={yellow_pct:.2f}%, Green={green_pct:.2f}%, Brown={brown_pct:.2f}%")
+
+    if brown_pct <= 15:
+        if yellow_pct >= 60:
+            state = "bom_estado"
+            color = (0, 255, 255)
+        elif yellow_pct >= 40:
+            state = "madura"
+            color = (0, 165, 255)
+        elif green_pct >= 50:
+            state = "verde"
+            color = (0, 255, 0)
+        else:
+            state = "madura"
+            color = (0, 165, 255)
+    else:
+        if yellow_pct >= 50 and brown_pct <= 30:
+            state = "madura"
+            color = (0, 165, 255)
+        else:
+            state = "mau_estado"
+            color = (0, 0, 255)
+
+    return state, color
+
+def classify_apple_quality(image):
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    hsv_image = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+    kernel = np.ones((5,5), np.uint8)
+
+    brown_range = COLOR_RANGES["apple"]["brown"]
+    mask_brown = cv2.inRange(hsv_image, brown_range["lower"], brown_range["upper"])
+    mask_brown = cv2.morphologyEx(mask_brown, cv2.MORPH_OPEN, kernel)
+    mask_brown = cv2.morphologyEx(mask_brown, cv2.MORPH_CLOSE, kernel)
+
+    masks = {}
+    for color in ["red1", "red2", "green", "yellow"]:
+        ranges = COLOR_RANGES["apple"][color]
+        mask = cv2.inRange(hsv_image, ranges["lower"], ranges["upper"])
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        masks[color] = mask
+
+    mask_red = cv2.bitwise_or(masks["red1"], masks["red2"])
+
+    total_mask = cv2.bitwise_or(mask_red, masks["green"])
+    total_mask = cv2.bitwise_or(total_mask, masks["yellow"])
+
+    total_area = cv2.countNonZero(total_mask)
+    brown_area = cv2.countNonZero(mask_brown)
+
+    if total_area > 0:
+        brown_pct = (brown_area / total_area) * 100
+    else:
+        brown_pct = 0
+
+    logging.debug(f"Apple brown percentage: {brown_pct:.2f}%")
+
+    if brown_pct > 5:
+        state = "mau_estado"
+        color = (0, 0, 255)
+    else:
+        state = "bom_estado"
+        color = (0, 255, 0)
+
+    return state, color
+
+def classify_fruit_quality(image, class_name):
+    try:
+        if image is None or image.size == 0:
+            logging.error("Empty image passed to classify_fruit_quality.")
+            return "desconhecido", (255, 255, 255)
+
+        if class_name == "banana":
+            return classify_banana_quality(image)
+        elif class_name == "apple":
+            return classify_apple_quality(image)
+        else:
+            state = "desconhecido"
+            color = (255, 255, 255)
+        return state, color
+
+    except Exception as e:
+        logging.error(f"Error in classify_fruit_quality: {e}")
+        return "desconhecido", (255, 255, 255)
+
+def move_servo(servo, angle):
+    try:
+        if servo == pan_servo:
+            angle = max(PAN_MIN, min(PAN_MAX, angle))
+        elif servo == tilt_servo:
+            angle = max(TILT_MIN, min(TILT_MAX, angle))
+        kit.servo[servo].angle = angle
+        logging.debug(f"Moved servo {servo} to angle {angle}")
+    except Exception as e:
+        logging.error(f"Error moving servo: {e}")
+
+def sweep_camera():
+    global sweeping, pan_direction, tilt_direction, current_tilt, current_pan
+
+    if not sweeping:
+        return
+
+    new_pan = current_pan + (SWEEP_PAN_STEP * pan_direction)
+
+    if new_pan >= PAN_MAX:
+        new_pan = PAN_MAX
+        pan_direction = -1
+    elif new_pan <= PAN_MIN:
+        new_pan = PAN_MIN
+        pan_direction = 1
+
+    if new_pan == PAN_MAX or new_pan == PAN_MIN:
+        new_tilt = current_tilt + (SWEEP_TILT_STEP * tilt_direction)
+        if new_tilt >= TILT_MAX:
+            new_tilt = TILT_MAX
+            tilt_direction = -1
+        elif new_tilt <= SWEEP_TILT_MIN:
+            new_tilt = SWEEP_TILT_MIN
+            tilt_direction = 1
+        move_servo(tilt_servo, new_tilt)
+        current_tilt = new_tilt
+
+    move_servo(pan_servo, new_pan)
+    current_pan = new_pan
+    time.sleep(SWEEP_DELAY)
+
+def fine_tune_camera(target_x, target_y, frame_width, frame_height):
+    global current_pan, current_tilt
+
+    center_x, center_y = frame_width // 2, frame_height // 2
+
+    DEAD_ZONE_X = 20
+    DEAD_ZONE_Y = 20
+
+    if abs(target_x - center_x) > DEAD_ZONE_X:
+        pan_dir = 1 if target_x > center_x else -1
+        new_pan = current_pan + (FINE_TUNE_STEP * pan_dir)
+        new_pan = max(PAN_MIN, min(PAN_MAX, new_pan))
+        if new_pan != current_pan:
+            move_servo(pan_servo, new_pan)
+            current_pan = new_pan
+
+    if abs(target_y - center_y) > DEAD_ZONE_Y:
+        tilt_dir = 1 if target_y > center_y else -1
+        new_tilt = current_tilt + (FINE_TUNE_STEP * tilt_dir)
+        new_tilt = max(TILT_MIN, min(TILT_MAX, new_tilt))
+        if new_tilt != current_tilt:
+            move_servo(tilt_servo, new_tilt)
+            current_tilt = new_tilt
+
+    time.sleep(FINE_TUNE_DELAY)
+    logging.debug(f"Fine-tuning - Pan: {current_pan}, Tilt: {current_tilt}")
+
+def get_output_layers(net):
+    layer_names = net.getLayerNames()
+    try:
+        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+    except IndexError:
+        output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    return output_layers
+
+def detect_fruits(frame):
+    try:
+        height, width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (320, 320), swapRB=True, crop=False)
+        net.setInput(blob)
+        outs = net.forward(get_output_layers(net))
+
+        class_ids = []
+        confidences = []
+        boxes = []
+
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > CONFIDENCE_THRESHOLD and classes[class_id] in DETECTION_CLASSES:
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = center_x - w // 2
+                    y = center_y - h // 2
+                    class_ids.append(class_id)
+                    confidences.append(float(confidence))
+                    boxes.append([x, y, w, h])
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+
+        detections = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                detections.append(boxes[i] + [classes[class_ids[i]], confidences[i]])
+
+        return detections
+    except Exception as e:
+        logging.error(f"Error during fruit detection: {e}")
+        return []
+
+def visualize_lidar(lidar_data, window_name="LIDAR Visualization"):
+    if not lidar_data:
+        return None
+
+    lidar_frame = np.zeros((400, 400, 3), dtype=np.uint8)
+    center = (200, 200)
+    max_distance = 5.0
+
+    num_points = len(lidar_data)
+    for i, distance in enumerate(lidar_data):
+        if distance > 0 and distance < max_distance:
+            angle = i * 2 * np.pi / num_points + (np.pi / 2)
+            x = int(center[0] - np.cos(angle) * distance * 40)
+            y = int(center[1] + np.sin(angle) * distance * 40)
+            cv2.circle(lidar_frame, (x, y), 2, (0, 255, 0), -1)
+
+    cv2.circle(lidar_frame, center, 3, (0, 0, 255), -1)
+    cv2.line(lidar_frame, center, (center[0], 0), (255, 0, 0), 1)
+
+    return lidar_frame
+
+def calculate_fruit_angle(center_x, frame_width):
+    field_of_view = 62
+    angle_per_pixel = field_of_view / frame_width
+    pixel_offset = center_x - (frame_width / 2)
+    angle = pixel_offset * angle_per_pixel
+    total_angle = current_pan - PAN_DEFAULT + angle
+    return total_angle
+
+def quantize_angle(angle):
+    steps = [10, 20, 30, 45]
+    abs_angle = abs(angle)
+    for step in steps:
+        if abs_angle <= step:
+            quantized_angle = step
+            break
+    else:
+        quantized_angle = 45
+    return quantized_angle
+
+def calculate_repulsive_force(lidar_data):
+    x_r = 0.0
+    y_r = 0.0
+    for i in range(len(lidar_data)):
+        distance = lidar_data[i]
+        if 0.08 < distance < OBSTACLE_INFLUENCE_DISTANCE:
+            angle = lidar_angle_min + i * lidar_angle_increment
+            weight = 1 / distance
+            x_r -= weight * np.cos(angle)
+            y_r -= weight * np.sin(angle)
+    repulsive_force = np.array([x_r, y_r]) * REPULSIVE_FORCE_GAIN
+    return repulsive_force
+
+def calculate_attractive_force(fruit_position):
+    if fruit_position is not None:
+        distance = np.linalg.norm(fruit_position)
+        if distance == 0:
+            return np.zeros(2)
+        direction = fruit_position / distance
+        return ATTRACTIVE_FORCE_GAIN * direction
+    else:
+        # Default attraction vector pointing straight ahead
+        return np.array([1.0, 0.0]) * ATTRACTIVE_FORCE_GAIN
+
+def determine_movement_direction(resultant_force):
+    if np.linalg.norm(resultant_force) == 0:
+        return "parar"
+    angle = np.arctan2(resultant_force[1], resultant_force[0])
+    if -np.pi / 4 <= angle < np.pi / 4:
+        return "frente"
+    elif np.pi / 4 <= angle < 3 * np.pi / 4:
+        return "esquerda"
+    elif -3 * np.pi / 4 <= angle < -np.pi / 4:
+        return "direita"
+    else:
+        return "trás"
+
+def handle_fruit_detection(frame, depth_frame, detections):
+    global last_fruit_alert_time, current_pan, current_tilt, sweeping, fine_tuning, frames_without_detection
+    global last_fruit_detection_time, last_reported_positions, fruit_last_seen_time
+    global fruit_state_analyzed, fruit_centered, fruit_processed, selected_fruit_index
+    global last_reported_distance, last_reported_angle, fruit_position
+
+    current_time = time.time()
+    fruit_detected = False
+
+    try:
+        if detections:
+            fruit_detected = True
+            frames_without_detection = 0
+            last_fruit_detection_time = current_time
+            fruit_last_seen_time = current_time
+
+            fruit_info_list = []
+            for idx, detection in enumerate(detections):
+                x, y, w, h, class_name, confidence = detection
+                x = max(0, x)
+                y = max(0, y)
+                x_end = min(frame.shape[1], x + w)
+                y_end = min(frame.shape[0], y + h)
+                w = x_end - x
+                h = y_end - y
+                fruit_roi = frame[y:y + h, x:x + w]
+                fruit_state, _ = classify_fruit_quality(fruit_roi, class_name)
+                fruit_info_list.append({
+                    "index": idx,
+                    "bbox": (x, y, w, h),
+                    "class_name": class_name,
+                    "confidence": confidence,
+                    "state": fruit_state
+                })
+
+            fruit_info_list.sort(key=lambda f: (
+                ("bom_estado", "madura", "verde", "mau_estado").index(f["state"]),
+                abs((f["bbox"][0] + f["bbox"][2] // 2) - frame.shape[1] // 2)
+            ))
+
+            selected_fruit = fruit_info_list[0]
+            selected_fruit_index = selected_fruit["index"]
+            x, y, w, h = selected_fruit["bbox"]
+            class_name = selected_fruit["class_name"]
+            confidence = selected_fruit["confidence"]
+            fruit_state = selected_fruit["state"]
+            center_x = x + w // 2
+            center_y = y + h // 2
+
+            if sweeping:
+                sweeping = False
+                logging.info(f"{class_name} detected, centering camera.")
+
+            frame_center_x, frame_center_y = frame.shape[1] // 2, frame.shape[0] // 2
+            offset_x = abs(center_x - frame_center_x)
+            offset_y = abs(center_y - frame_center_y)
+            CENTER_THRESHOLD = 10
+
+            if offset_x <= CENTER_THRESHOLD and offset_y <= CENTER_THRESHOLD:
+                fruit_centered = True
+                logging.debug("Fruit is centered.")
+            else:
+                fruit_centered = False
+
+            fine_tune_camera(center_x, center_y, frame.shape[1], frame.shape[0])
+
+            if fruit_centered:
+                distance = get_distance(depth_frame, (x, y, w, h))
+                if distance is not None:
+                    distance_cm = distance / 10
+                    if distance_cm == 0:
+                        distance_cm = 0.1
+
+                    angle = calculate_fruit_angle(center_x, frame.shape[1])
+                    quantized_angle = quantize_angle(angle)
+                    direction = "direita" if angle > 0 else "esquerda"
+
+                    display_name = CLASS_DISPLAY_NAMES.get(class_name, class_name)
+
+                    distance_variation = abs(
+                        distance_cm - last_reported_distance) if last_reported_distance else None
+                    angle_variation = abs(angle - last_reported_angle) if last_reported_angle else None
+
+                    if (distance_variation and distance_variation > DISTANCE_VARIATION_THRESHOLD) or \
+                            (angle_variation and angle_variation > ANGLE_VARIATION_THRESHOLD) or \
+                            (last_reported_distance is None or last_reported_angle is None):
+
+                        message = f"{display_name} a {distance_cm:.1f} centímetros, {quantized_angle} graus à {direction}."
+                        if current_time - last_fruit_alert_time > SPEECH_COOLDOWN:
+                            speech_queue.put(message)
+                            last_fruit_alert_time = current_time
+                            last_reported_distance = distance_cm
+                            last_reported_angle = angle
+
+                    log_data(current_pan, current_tilt, True, class_name, confidence, fruit_state, distance_cm,
+                             angle)
+
+                    if not fruit_processed and fruit_centered:
+                        display_name = CLASS_DISPLAY_NAMES.get(class_name, class_name)
+                        if fruit_state == "bom_estado":
+                            state_message = f"A {display_name} está em bom estado."
+                        elif fruit_state == "madura":
+                            state_message = f"A {display_name} está madura."
+                        elif fruit_state == "mau_estado":
+                            state_message = f"A {display_name} está em mau estado."
+                        elif fruit_state == "verde":
+                            state_message = f"A {display_name} está verde."
+                        else:
+                            state_message = f"Não foi possível determinar o estado da {display_name}."
+
+                        speech_queue.put(f"Analisando o estado da {display_name}.")
+                        speech_queue.put(state_message)
+                        fruit_state_analyzed = True
+                        fruit_processed = True
+
+            for fruit_info in fruit_info_list:
+                x, y, w, h = fruit_info["bbox"]
+                class_name = fruit_info["class_name"]
+                confidence = fruit_info["confidence"]
+                fruit_state = fruit_info["state"]
+                if fruit_info["index"] == selected_fruit_index:
+                    color = (0, 255, 0)
+                else:
+                    color = (255, 255, 0)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                label = f"{class_name} ({fruit_state}): {confidence:.2f}"
+                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            move_servo(pan_servo, current_pan)
+            move_servo(tilt_servo, current_tilt)
+
+            # Update fruit_position for potential fields
+            fruit_position = np.array([center_x - frame.shape[1] / 2, center_y - frame.shape[0] / 2])
+
+        else:
+            frames_without_detection += 1
+            if fruit_last_seen_time and (current_time - fruit_last_seen_time) > FRUIT_LOSS_TIMEOUT:
+                if not sweeping:
+                    logging.warning("Fruit lost, restarting sweep.")
+                    sweeping = True
+                    frames_without_detection = 0
+                    fruit_centered = False
+                    last_reported_positions.clear()
+                    fruit_last_seen_time = None
+                    fruit_state_analyzed = False
+                    fruit_processed = False
+                    selected_fruit_index = None
+                    last_reported_distance = None
+                    last_reported_angle = None
+                    fruit_position = None
+
+    except Exception as e:
+        logging.error(f"Error handling fruit detection: {e}")
+
+    return frame
+
+def detect_obstacles(lidar_data):
+    global last_obstacle_announce_time, fruit_position
+
+    if not lidar_data:
+        return None, None
+
+    current_time = time.time()
+
+    try:
+        if is_cart_moving():
+            return None, None
+
+        # Calculate repulsive force from obstacles
+        repulsive_force = calculate_repulsive_force(lidar_data)
+
+        # Calculate attractive force towards the fruit (if detected)
+        attractive_force = calculate_attractive_force(fruit_position)
+
+        # Combine forces
+        resultant_force = attractive_force + repulsive_force
+
+        # Compute magnitude of repulsive force
+        repulsive_magnitude = np.linalg.norm(repulsive_force)
+        logging.debug(f"Repulsive force magnitude: {repulsive_magnitude}")
+
+        # Threshold for considering the path clear
+        REPULSIVE_FORCE_THRESHOLD = 0.1
+
+        if repulsive_magnitude < REPULSIVE_FORCE_THRESHOLD:
+            # Path is clear
+            if current_time - last_obstacle_announce_time > SPEECH_COOLDOWN:
+                message = "Caminho livre à frente."
+                speech_queue.put(message)
+                last_obstacle_announce_time = current_time
+        else:
+            # Obstacles detected, perhaps avoid informing
+            pass
+
+        # For movement, we can still determine the movement direction
+        movement_direction = determine_movement_direction(resultant_force)
+
+        return movement_direction, resultant_force
+
+    except Exception as e:
+        logging.error(f"Error detecting obstacles: {e}")
+
+    return None, None
+
+def speech_worker():
+    global last_speech_time
+    while running:
+        try:
+            message = speech_queue.get()
+            current_time = time.time()
+            if current_time - last_speech_time >= SPEECH_COOLDOWN:
+                text_to_speech(message)
+                last_speech_time = current_time
+            speech_queue.task_done()
+        except Exception as e:
+            logging.error(f"Error in speech worker: {e}")
+
+def get_user_choice():
+    global fruit
+    choice_result = {'choice': None}
+
+    def voice_input():
+        nonlocal choice_result
+        r = sr.Recognizer()
+        initialize_pygame()
+
+        usb_mic_index = 11  # Adjust as needed
+        try:
+            mic = sr.Microphone(device_index=usb_mic_index)
+        except Exception as e:
+            logging.error(f"Microphone with index {usb_mic_index} not found: {e}")
+            return
+
+        with mic as source:
+            r.adjust_for_ambient_noise(source)
+            logging.info("Adjusting for ambient noise...")
+            logging.info("Listening for activation phrase...")
+
+        while running and sleep_mode and not choice_event.is_set():
+            try:
+                with mic as source:
+                    audio = r.listen(source, timeout=5, phrase_time_limit=5)
+                recognized_phrase = ""
+                try:
+                    recognized_phrase = r.recognize_google(audio, language='pt-BR').lower()
+                    logging.info(f"You said: {recognized_phrase}")
+                except sr.UnknownValueError:
+                    logging.info("Could not understand audio")
+                    continue
+                except sr.RequestError as e:
+                    logging.error(f"Could not request results; {e}")
+                    continue
+
+                if any(phrase in recognized_phrase for phrase in ACTIVATION_PHRASES):
+                    text_to_speech("Olá, como você está? Gostaria de escolher banana ou maçã?")
+                    max_attempts = 3
+                    attempts = 0
+                    while attempts < max_attempts and not choice_event.is_set():
+                        logging.info("Listening for your choice (banana ou maçã)...")
+                        with mic as source:
+                            audio = r.listen(source, timeout=5, phrase_time_limit=5)
+                        try:
+                            choice = r.recognize_google(audio, language='pt-BR').lower()
+                            logging.info(f"You said: {choice}")
+                            if "banana" in choice:
+                                text_to_speech("Ok, procurando por banana")
+                                choice_result['choice'] = "banana"
+                                choice_event.set()
+                                return
+                            elif "maçã" in choice or "maça" in choice:
+                                text_to_speech("Ok, procurando por maçã")
+                                choice_result['choice'] = "apple"
+                                choice_event.set()
+                                return
+                            else:
+                                text_to_speech("Desculpe, não entendi. Por favor, diga banana ou maçã.")
+                                attempts += 1
+                        except sr.UnknownValueError:
+                            text_to_speech("Desculpe, não entendi. Por favor, diga banana ou maçã.")
+                            attempts += 1
+                        except sr.RequestError as e:
+                            logging.error(f"Could not request results; {e}")
+                            attempts += 1
+
+                    text_to_speech("Não consegui entender. Você também pode usar o teclado para escolher.")
+                    return
+
+                else:
+                    continue
+            except sr.WaitTimeoutError:
+                logging.info("Listening timed out while waiting for activation phrase.")
+                continue
+            except KeyboardInterrupt:
+                logging.info("Exiting voice assistant...")
+                return
+
+    def keyboard_input():
+        nonlocal choice_result
+
+        def on_press(key):
+            global fruit, running
+            if choice_event.is_set():
+                return False  # Stop listener
+            try:
+                if key == keyboard.KeyCode.from_char('b'):  # 'b' key
+                    fruit = "banana"
+                    choice_result['choice'] = fruit
+                    logging.info(f"Key pressed: {fruit}")
+                    text_to_speech("Ok, procurando por banana")
+                    choice_event.set()
+                    return False
+                elif key == keyboard.KeyCode.from_char('m'):  # 'm' key
+                    fruit = "apple"
+                    choice_result['choice'] = fruit
+                    logging.info(f"Key pressed: {fruit}")
+                    text_to_speech("Ok, procurando por maçã")
+                    choice_event.set()
+                    return False
+                elif key == keyboard.KeyCode.from_char('i'):  # 'i' key
+                    fruit = None  # Restart or trigger voice assistant
+                    logging.info("Restarting or triggering voice assistant")
+                    text_to_speech("Reiniciando, por favor diga o nome da fruta.")
+                    choice_event.set()
+                    return False
+                elif key == keyboard.KeyCode.from_char('q'):
+                    logging.info("Stopping the program...")
+                    choice_event.set()
+                    running = False
+                    sys.exit(0)
+            except AttributeError:
+                pass
+
+        listener = keyboard.Listener(on_press=on_press, suppress=True)
+        listener.start()
+
+        # Keep the thread alive while waiting for the choice
+        while running and sleep_mode and not choice_event.is_set():
+            time.sleep(0.01)
+
+        listener.stop()
+        listener.join()
+
+    # Start both input methods
+    voice_thread = Thread(target=voice_input)
+    keyboard_thread = Thread(target=keyboard_input)
+    voice_thread.start()
+    keyboard_thread.start()
+
+    choice_event.wait()  # Wait until a choice is made
+    voice_thread.join()
+
+    return choice_result['choice']
+
+def main():
+    global sweeping, fine_tuning, frames_without_detection, current_pan, current_tilt
+    global last_fruit_detection_time, fruit_last_seen_time, DETECTION_CLASSES, sleep_mode, running
+    global fruit_state_analyzed, fruit_processed, user_choice, initial_obstacle_alert_made
+
+    logging.info("Initializing ROS node...")
+    rospy.init_node('fruit_detection_system', anonymous=True)
+    rospy.Subscriber("/scan", LaserScan, lidar_callback)
+    rospy.Subscriber("/map", OccupancyGrid, occupancy_grid_callback)
+    rospy.Subscriber("/acceleration", Vector3, acceleration_callback)
+    logging.info("ROS node initialized and subscribed to topics.")
+
+    setup_log_file()
+    initialize_pygame()
+
+    speech_thread = Thread(target=speech_worker, daemon=True)
+    speech_thread.start()
+
+    pipeline = dai.Pipeline()
+    camRgb = pipeline.createColorCamera()
+    xoutRgb = pipeline.createXLinkOut()
+    xoutRgb.setStreamName("rgb")
+    camRgb.setPreviewSize(320, 320)
+    camRgb.setInterleaved(False)
+    camRgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    camRgb.preview.link(xoutRgb.input)
+
+    monoLeft = pipeline.createMonoCamera()
+    monoRight = pipeline.createMonoCamera()
+    stereo = pipeline.createStereoDepth()
+    xoutDepth = pipeline.createXLinkOut()
+    xoutDepth.setStreamName("depth")
+
+    monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    monoLeft.setBoardSocket(dai.CameraBoardSocket.LEFT)
+    monoRight.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+
+    stereo.setLeftRightCheck(True)
+    stereo.setSubpixel(True)
+    monoLeft.out.link(stereo.left)
+    monoRight.out.link(stereo.right)
+    stereo.depth.link(xoutDepth.input)
+
+    with dai.Device(pipeline) as device:
+        qRgb = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        qDepth = device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+
+        move_servo(pan_servo, PAN_DEFAULT)
+        move_servo(tilt_servo, TILT_DEFAULT)
+
+        speech_queue.put("Sistema pronto.")
+        logging.info("System ready.")
+        print("System ready.")
+        start_time = time.time()
+        frames_processed = 0
+
+        while running:
+            if sleep_mode:
+                choice_event.clear()
+                choice = get_user_choice()
+                if choice:
+                    with user_choice_lock:
+                        user_choice = choice
+                    DETECTION_CLASSES = [user_choice]
+                    logging.info(f"Detecting fruit: {user_choice}")
+                    sleep_mode = False
+                    fruit_state_analyzed = False
+                    fruit_processed = False
+                    initial_obstacle_alert_made = False
+                    user_choice = None
+                    move_servo(pan_servo, PAN_DEFAULT)
+                    move_servo(tilt_servo, TILT_DEFAULT)
+                    sweeping = True
+                else:
+                    time.sleep(0.01)
+                    continue
+
+            try:
+                if not rospy.is_shutdown() and running:
+                    inRgb = qRgb.tryGet()
+                    inDepth = qDepth.tryGet()
+
+                    if inRgb is not None and inDepth is not None:
+                        frame = inRgb.getCvFrame()
+                        depth_frame = inDepth.getFrame()
+
+                        detections = detect_fruits(frame)
+                        frame = handle_fruit_detection(frame, depth_frame, detections)
+
+                        if sweeping:
+                            sweep_camera()
+
+                        movement_direction, resultant_force = detect_obstacles(lidar_data)
+                        # The speech is handled inside detect_obstacles, so no need to do anything here.
+
+                        lidar_visualization = visualize_lidar(lidar_data)
+                        if lidar_visualization is not None:
+                            cv2.imshow("LIDAR Visualization", lidar_visualization)
+
+                        depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_frame, alpha=0.03),
+                                                           cv2.COLORMAP_JET)
+                        cv2.imshow("Depth View", depth_colormap)
+
+                        h, w = frame.shape[:2]
+                        cv2.line(frame, (w // 2 - 20, h // 2), (w // 2 + 20, h // 2), (255, 0, 0), 2)
+                        cv2.line(frame, (w // 2, h // 2 - 20), (w // 2, h // 2 + 20), (255, 0, 0), 2)
+
+                        cv2.putText(frame, f"Pan: {current_pan:.1f}, Tilt: {current_tilt:.1f}", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                        frames_processed += 1
+                        elapsed_time = time.time() - start_time
+                        fps = frames_processed / elapsed_time if elapsed_time > 0 else 0
+                        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                        cv2.imshow("Fruit Detection and Tracking", frame)
+
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            running = False
+                            break
+
+                    else:
+                        time.sleep(0.01)
+
+                else:
+                    break
+
+            except Exception as e:
+                logging.error(f"An error occurred: {e}")
+                emergency_stop()
+            finally:
+                pass
+
+        cv2.destroyAllWindows()
+
+def emergency_stop():
+    move_servo(pan_servo, PAN_DEFAULT)
+    move_servo(tilt_servo, TILT_DEFAULT)
+    logging.warning("Emergency stop triggered. Servos returned to default positions.")
+
+def shutdown():
+    global running, sleep_mode
+    logging.info("Shutting down...")
+    running = False
+    sleep_mode = True
+    move_servo(pan_servo, PAN_DEFAULT)
+    move_servo(tilt_servo, TILT_DEFAULT)
+    cv2.destroyAllWindows()
+    pygame.quit()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
+    except SystemExit:
+        pass
+    except Exception as e:
+        logging.error(f"Unhandled exception in main: {e}")
+    finally:
+        shutdown()
