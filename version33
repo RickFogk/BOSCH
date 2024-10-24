@@ -1,0 +1,597 @@
+import cv2
+import numpy as np
+import depthai as dai
+import rospy
+from sensor_msgs.msg import LaserScan, Range
+from geometry_msgs.msg import Vector3
+import time
+from threading import Thread, Lock, Event
+from queue import Queue
+from gtts import gTTS
+import os
+import pygame
+import logging
+import csv
+from datetime import datetime
+from adafruit_servokit import ServoKit
+import math
+import sys
+import speech_recognition as sr
+from pynput import keyboard
+
+# ===========================
+# Configuration
+# ===========================
+
+# Initialize logging with more detailed format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
+    handlers=[
+        logging.FileHandler('system.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Global variables with thread-safe initialization
+lidar_data = []
+lidar_angle_min = 0.0
+lidar_angle_max = 0.0
+lidar_angle_increment = 0.0
+acceleration_data = Vector3()
+ultrasonic_data = {"left": None, "right": None}
+speech_queue = Queue()
+last_speech_time = 0
+SPEECH_COOLDOWN = 3
+last_obstacle_announce_time = 0
+last_object_announcement_time = 0
+sweeping = False
+fine_tuning = False
+frames_without_detection = 0
+pan_direction = 1
+tilt_direction = 1
+current_tilt = 0
+current_pan = 30
+running = True
+fruit_state_analyzed = False
+fruit_centered = False
+sleep_mode = True
+fruit_processed = False
+user_choice = None
+user_choice_lock = Lock()
+keyboard_lock = Lock()
+choice_event = Event()
+selected_fruit_index = None
+fruit_position = None
+keyboard_override_event = Event()
+depth_frame2 = None
+obstacle_previously_detected = False
+camera_obstacle_previously_detected = False
+announced_obstacles = set()
+fruit_last_seen_time = None
+cart_moving_forward = False
+cart_moving_start_time = None
+initial_obstacle_alert_made = False
+waiting_for_trigger = True
+fruit_centering_start_time = None
+
+# Constants
+PAN_DEFAULT, TILT_DEFAULT = 30, 0
+PAN_MIN, PAN_MAX = 0, 90
+TILT_MIN, TILT_MAX = 0, 90
+MAX_FRAMES_WITHOUT_DETECTION = 10
+SWEEP_PAN_STEP = 5
+SWEEP_TILT_STEP = 5
+SWEEP_DELAY = 0.005
+FINE_TUNE_DELAY = 0.005
+CONFIDENCE_THRESHOLD = 0.3
+NMS_THRESHOLD = 0.4
+OBSTACLE_DISTANCE_THRESHOLD = 1.0
+DETECTION_ANGLE_RANGE = 90
+OBSTACLE_ANNOUNCE_INTERVAL = 5
+FRUIT_LOSS_THRESHOLD = 10
+POSITION_CHANGE_THRESHOLD = 0.2
+FRUIT_LOSS_TIMEOUT = 10
+CART_MOVING_THRESHOLD = 5
+CENTERING_TIMEOUT = 3
+CENTERING_THRESHOLD = 30
+MIN_ERROR_THRESHOLD = 5
+
+# Control parameters
+PAN_KP = 0.05
+TILT_KP = 0.05
+MAX_DELTA_ANGLE = 2
+
+# YOLO Configuration
+YOLO_WEIGHTS = "yolov4-tiny.weights"
+YOLO_CONFIG = "yolov4-tiny.cfg"
+COCO_NAMES = "coco.names"
+
+# Fruits and Classes
+FRUITS = ["banana", "apple"]
+DETECTION_CLASSES = FRUITS.copy()
+
+# Class display names mapping
+CLASS_DISPLAY_NAMES = {
+    "banana": "banana",
+    "apple": "maçã",
+    "person": "pessoa",
+    "bicycle": "bicicleta",
+    "car": "carro",
+    "truck": "caminhão",
+    "chair": "cadeira",
+    "dining table": "mesa",
+    "potted plant": "planta",
+    "backpack": "mochila",
+    "handbag": "bolsa",
+    "suitcase": "mala",
+    "bottle": "garrafa",
+    "cup": "copo",
+    "umbrella": "guarda-chuva",
+}
+
+# Obstacle classes
+OBSTACLE_CLASSES = [
+    "person", "bicycle", "car", "truck", "chair", "dining table",
+    "potted plant", "backpack", "handbag", "suitcase", "bottle", "cup", "umbrella"
+]
+
+# Load COCO class names with error handling
+try:
+    with open(COCO_NAMES, "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    OBSTACLE_CLASS_IDS = [classes.index(cls_name) for cls_name in OBSTACLE_CLASSES if cls_name in classes]
+    logging.info("COCO class names loaded successfully.")
+except Exception as e:
+    logging.error(f"Failed to load COCO class names: {e}")
+    sys.exit(1)
+
+# Color ranges for fruit quality detection
+COLOR_RANGES = {
+    "banana": {
+        "green": {"lower": np.array([36, 50, 70]), "upper": np.array([89, 255, 255])},
+        "yellow": {"lower": np.array([20, 100, 100]), "upper": np.array([30, 255, 255])},
+        "brown": {"lower": np.array([10, 50, 20]), "upper": np.array([20, 200, 200])},
+        "black": {"lower": np.array([0, 0, 0]), "upper": np.array([180, 255, 30])},
+    },
+    "apple": {
+        "red1": {"lower": np.array([0, 70, 50]), "upper": np.array([10, 255, 255])},
+        "red2": {"lower": np.array([170, 70, 50]), "upper": np.array([180, 255, 255])},
+        "green": {"lower": np.array([36, 50, 70]), "upper": np.array([89, 255, 255])},
+        "yellow": {"lower": np.array([15, 50, 70]), "upper": np.array([35, 255, 255])},
+        "brown": {"lower": np.array([0, 0, 0]), "upper": np.array([20, 255, 70])},
+        "black": {"lower": np.array([0, 0, 0]), "upper": np.array([180, 255, 30])},
+    }
+}
+
+# Activation phrases
+ACTIVATION_PHRASES = [
+    "olá smartface", "ola smartface",
+    "olá smart face", "ola smart face",
+    "olá smartfeice", "ola smartfeice",
+    "olá smartfeiz", "ola smartfeiz",
+    "olá smartfez", "ola smartfez",
+    "hello smartface", "hello smart face",
+    "olá smart faze", "ola smart faze",
+    "olá smart fas", "ola smart fas",
+    "olá smartfaiz", "ola smartfaiz",
+    "olá smartfase", "ola smartfase",
+    "olá smartfaz", "ola smartfaz",
+]
+
+# Phonetic variations
+BANANA_PHRASES = [
+    "banana", "ban ana", "ba nana", "bana na", "ban aná", "ban anã", "ba nã nã",
+    "bananas", "banãna", "bananna", "banána"
+]
+
+APPLE_PHRASES = [
+    "maçã", "maça", "massa", "macã", "macan", "ma san", "ma çã",
+    "marçã", "marça", "ma sa", "mar sa", "mar san", "macan", "ma cã",
+    "maçaã", "maçan", "ma san", "maçan", "maç", "maçaã",
+    "massan", "m'assam", "mansam", "mansã", "masan", "masã", "maçam", "maasam"
+]
+
+
+# ===========================
+# Initialization Functions
+# ===========================
+
+def initialize_system():
+    """Initialize all system components with error handling"""
+    try:
+        # Initialize ServoKit
+        global kit
+        kit = ServoKit(channels=16)
+        logging.info("ServoKit initialized successfully.")
+
+        # Initialize YOLO model
+        global net
+        net = cv2.dnn.readNet(YOLO_WEIGHTS, YOLO_CONFIG)
+        try:
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+            logging.info("YOLO model loaded with CUDA backend.")
+        except Exception as e:
+            logging.warning(f"CUDA initialization failed: {e}. Falling back to CPU.")
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+        # Initialize Pygame
+        pygame.init()
+        pygame.mixer.init()
+        logging.info("Pygame initialized successfully.")
+
+        return True
+
+    except Exception as e:
+        logging.error(f"System initialization failed: {e}")
+        return False
+
+
+# ===========================
+# Utility Functions
+# ===========================
+
+def safe_shutdown():
+    """Safely shutdown all system components"""
+    global running
+    try:
+        running = False
+        move_servo(pan_servo, PAN_DEFAULT)
+        move_servo(tilt_servo, TILT_DEFAULT)
+        pygame.quit()
+        cv2.destroyAllWindows()
+        logging.info("System shutdown completed successfully.")
+    except Exception as e:
+        logging.error(f"Error during shutdown: {e}")
+
+
+def emergency_stop():
+    """Handle emergency situations"""
+    try:
+        move_servo(pan_servo, PAN_DEFAULT)
+        move_servo(tilt_servo, TILT_DEFAULT)
+        logging.warning("Emergency stop triggered.")
+        safe_shutdown()
+    except Exception as e:
+        logging.error(f"Emergency stop failed: {e}")
+
+
+# ===========================
+# Camera and Detection Functions
+# ===========================
+
+def setup_camera_pipeline():
+    """Setup and configure the OAK-D camera pipeline"""
+    try:
+        pipeline = dai.Pipeline()
+
+        # Configure RGB camera
+        camRgb = pipeline.createColorCamera()
+        xoutRgb = pipeline.createXLinkOut()
+        xoutRgb.setStreamName("rgb")
+        camRgb.setPreviewSize(320, 320)
+        camRgb.setInterleaved(False)
+        camRgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        camRgb.preview.link(xoutRgb.input)
+
+        # Configure depth
+        monoLeft = pipeline.createMonoCamera()
+        monoRight = pipeline.createMonoCamera()
+        stereo = pipeline.createStereoDepth()
+        xoutDepth = pipeline.createXLinkOut()
+        xoutDepth.setStreamName("depth")
+
+        # Configure mono cameras
+        monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        monoLeft.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        monoRight.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+
+        # Configure stereo
+        stereo.setLeftRightCheck(True)
+        stereo.setSubpixel(True)
+        monoLeft.out.link(stereo.left)
+        monoRight.out.link(stereo.right)
+        stereo.depth.link(xoutDepth.input)
+
+        return pipeline
+    except Exception as e:
+        logging.error(f"Failed to setup camera pipeline: {e}")
+        return None
+
+
+def detect_and_process_frame(frame, depth_frame, is_obstacle_detection=False):
+    """Detect and process objects in a frame"""
+    try:
+        if frame is None:
+            return None, []
+
+        height, width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (320, 320), swapRB=True, crop=False)
+        net.setInput(blob)
+        detections = []
+
+        outs = net.forward(get_output_layers(net))
+        class_ids = []
+        confidences = []
+        boxes = []
+
+        # Process detections
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                class_name = classes[class_id]
+
+                if (is_obstacle_detection and class_name in OBSTACLE_CLASSES) or \
+                        (not is_obstacle_detection and class_name in DETECTION_CLASSES):
+                    confidence = scores[class_id]
+                    if confidence > CONFIDENCE_THRESHOLD:
+                        center_x = int(detection[0] * width)
+                        center_y = int(detection[1] * height)
+                        w = int(detection[2] * width)
+                        h = int(detection[3] * height)
+                        x = center_x - w // 2
+                        y = center_y - h // 2
+                        class_ids.append(class_id)
+                        confidences.append(float(confidence))
+                        boxes.append([x, y, w, h])
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+
+        processed_frame = frame.copy()
+        if len(indices) > 0:
+            for i in indices.flatten():
+                box = boxes[i]
+                x, y, w, h = box
+                class_name = classes[class_ids[i]]
+                confidence = confidences[i]
+
+                # Get distance if depth frame is available
+                distance = None
+                if depth_frame is not None:
+                    distance = get_distance(depth_frame, box)
+
+                detections.append({
+                    'box': box,
+                    'class_name': class_name,
+                    'confidence': confidence,
+                    'distance': distance
+                })
+
+                # Draw detection on frame
+                color = (0, 255, 0) if not is_obstacle_detection else (0, 0, 255)
+                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+                label = f"{class_name}: {confidence:.2f}"
+                cv2.putText(processed_frame, label, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        return processed_frame, detections
+
+    except Exception as e:
+        logging.error(f"Error in detect_and_process_frame: {e}")
+        return frame, []
+
+
+# ===========================
+# Main Processing Loop
+# ===========================
+
+def main_processing_loop():
+    """Main processing loop with error handling"""
+    global running, waiting_for_trigger, sleep_mode
+
+    try:
+        # Initialize cameras
+        pipeline1 = setup_camera_pipeline()
+        pipeline2 = setup_camera_pipeline()
+
+        if pipeline1 is None or pipeline2 is None:
+            raise Exception("Failed to initialize camera pipelines")
+
+            # Get available devices
+            available_devices = dai.Device.getAllAvailableDevices()
+            if len(available_devices) < 2:
+                raise Exception("Two Oak-D Lite devices are required")
+
+            device_info1 = available_devices[0]
+            device_info2 = available_devices[1]
+
+            with dai.Device(pipeline1, device_info1) as device1, dai.Device(pipeline2, device_info2) as device2:
+                # Get output queues
+                qRgb1 = device1.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+                qDepth1 = device1.getOutputQueue(name="depth", maxSize=4, blocking=False)
+                qRgb2 = device2.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+                qDepth2 = device2.getOutputQueue(name="depth", maxSize=4, blocking=False)
+
+                # Initialize servos
+                move_servo(pan_servo, PAN_DEFAULT)
+                move_servo(tilt_servo, TILT_DEFAULT)
+
+                # Start worker threads
+                threads = []
+                threads.append(Thread(target=speech_worker, daemon=True))
+                threads.append(Thread(target=keyboard_listener, daemon=True))
+                threads.append(Thread(target=voice_command_listener, daemon=True))
+
+                for thread in threads:
+                    thread.start()
+
+                # Announce system ready
+                speech_queue.put("Sistema inicializado. Diga: Olá Smartface para começarmos...")
+                logging.info("System ready and running")
+
+                while running and not rospy.is_shutdown():
+                    try:
+                        # Handle trigger waiting state
+                        if waiting_for_trigger:
+                            while waiting_for_trigger and running and not rospy.is_shutdown():
+                                if keyboard_override_event.is_set():
+                                    keyboard_override_event.clear()
+                                    break
+                                time.sleep(0.1)
+
+                            if not waiting_for_trigger:
+                                sleep_mode = True
+                            else:
+                                continue
+
+                        # Handle sleep mode
+                        if sleep_mode:
+                            reset_system_state()
+                            logging.info("Waiting for fruit choice")
+
+                            while sleep_mode and running and not rospy.is_shutdown():
+                                if keyboard_override_event.is_set():
+                                    keyboard_override_event.clear()
+                                    break
+                                time.sleep(0.1)
+
+                            if user_choice:
+                                DETECTION_CLASSES[:] = [user_choice]
+                                logging.info(f"Detecting fruit: {user_choice}")
+                                sweeping = True
+                            else:
+                                continue
+
+                        # Get camera frames
+                        inRgb1 = qRgb1.tryGet()
+                        inDepth1 = qDepth1.tryGet()
+                        inRgb2 = qRgb2.tryGet()
+                        inDepth2 = qDepth2.tryGet()
+
+                        if all(frame is not None for frame in [inRgb1, inDepth1, inRgb2, inDepth2]):
+                            # Process fruit detection camera
+                            frame1 = inRgb1.getCvFrame()
+                            depth_frame1 = inDepth1.getFrame()
+
+                            processed_frame1, fruit_detections = detect_and_process_frame(
+                                frame1, depth_frame1, is_obstacle_detection=False)
+
+                            if sweeping:
+                                sweep_camera()
+
+                            # Process obstacle detection camera
+                            frame2 = inRgb2.getCvFrame()
+                            depth_frame2 = inDepth2.getFrame()
+
+                            processed_frame2, obstacle_detections = detect_and_process_frame(
+                                frame2, depth_frame2, is_obstacle_detection=True)
+
+                            # Update displays
+                            update_display(processed_frame1, processed_frame2, depth_frame1, depth_frame2)
+
+                            # Handle detections
+                            handle_fruit_detection(processed_frame1, depth_frame1, fruit_detections)
+                            handle_obstacle_detection(processed_frame2, obstacle_detections)
+
+                            # Process LiDAR data
+                            if lidar_data:
+                                analyze_lidar_obstacles()
+
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            running = False
+                            break
+
+                    except Exception as e:
+                        logging.error(f"Error in main loop iteration: {e}")
+                        continue
+
+        except Exception as e:
+        logging.error(f"Fatal error in main processing loop: {e}")
+        emergency_stop()
+    finally:
+        safe_shutdown()
+
+
+def reset_system_state():
+    """Reset all system state variables"""
+    global sweeping, fine_tuning, frames_without_detection, fruit_last_seen_time
+    global fruit_state_analyzed, fruit_centered, fruit_processed, current_pan, current_tilt
+
+    sweeping = False
+    fine_tuning = False
+    frames_without_detection = 0
+    fruit_last_seen_time = None
+    fruit_state_analyzed = False
+    fruit_centered = False
+    fruit_processed = False
+    current_pan = PAN_DEFAULT
+    current_tilt = TILT_DEFAULT
+    announced_obstacles.clear()
+
+    move_servo(pan_servo, PAN_DEFAULT)
+    move_servo(tilt_servo, TILT_DEFAULT)
+
+
+def update_display(frame1, frame2, depth1, depth2):
+    """Update the display with all camera feeds and visualizations"""
+    try:
+        # Create depth colormaps
+        depth_colormap1 = cv2.applyColorMap(
+            cv2.convertScaleAbs(depth1, alpha=0.03),
+            cv2.COLORMAP_JET
+        )
+        depth_colormap2 = cv2.applyColorMap(
+            cv2.convertScaleAbs(depth2, alpha=0.03),
+            cv2.COLORMAP_JET
+        )
+
+        # Create LiDAR visualization
+        lidar_vis = visualize_lidar(lidar_data)
+        if lidar_vis is None:
+            lidar_vis = np.zeros((400, 400, 3), dtype=np.uint8)
+
+        # Resize all images to same size
+        target_size = (480, 360)
+        frame1_resized = cv2.resize(frame1, target_size)
+        frame2_resized = cv2.resize(frame2, target_size)
+        depth1_resized = cv2.resize(depth_colormap1, target_size)
+        depth2_resized = cv2.resize(depth_colormap2, target_size)
+        lidar_resized = cv2.resize(lidar_vis, target_size)
+
+        # Create mosaic
+        top_row = np.hstack((frame1_resized, depth1_resized))
+        bottom_row = np.hstack((frame2_resized, lidar_resized))
+        mosaic = np.vstack((top_row, bottom_row))
+
+        # Display mosaic
+        cv2.imshow("System Display", mosaic)
+
+    except Exception as e:
+        logging.error(f"Error updating display: {e}")
+
+
+# ===========================
+# Entry Point
+# ===========================
+
+if __name__ == "__main__":
+    try:
+        # Initialize system
+        if not initialize_system():
+            logging.error("System initialization failed")
+            sys.exit(1)
+
+        # Initialize ROS node
+        rospy.init_node('fruit_detection_system', anonymous=True)
+
+        # Set up ROS subscribers
+        rospy.Subscriber("/scan", LaserScan, lidar_callback)
+        rospy.Subscriber("/acceleration", Vector3, acceleration_callback)
+        rospy.Subscriber("/ultrasonic/left", Range, ultrasonic_left_callback)
+        rospy.Subscriber("/ultrasonic/right", Range, ultrasonic_right_callback)
+
+        # Start main processing loop
+        main_processing_loop()
+
+    except rospy.ROSInterruptException:
+        logging.info("ROS interrupt received")
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received")
+    except Exception as e:
+        logging.error(f"Unhandled exception: {e}")
+    finally:
+        safe_shutdown()
